@@ -1,36 +1,70 @@
-# This is a basic workflow to help you get started with Actions
+name: Validate PR Scope and Auto-Merge
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+permissions:
+  contents: write        # 合并 PR 需要
+  pull-requests: write   # 批准/操作 PR 需要
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  scope:
+    name: Check PR only touches libs/${{ github.event.pull_request.user.login }}/
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout PR head with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Validate changed paths
+        shell: bash
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -euo pipefail
+          git fetch origin "$BASE_REF"
+          MERGE_BASE=$(git merge-base "origin/$BASE_REF" HEAD)
+          mapfile -t FILES < <(git diff --name-only --no-renames "$MERGE_BASE" HEAD)
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::This PR contains no file changes."
+            exit 1
+          fi
+
+          PREFIX="libs/${AUTHOR}/"
+          BAD=0
+          for f in "${FILES[@]}"; do
+            echo "Changed: $f"
+            case "$f" in
+              "$PREFIX"*) ;;
+              *)
+                echo "::error file=$f::'$f' is outside '${PREFIX}'."
+                BAD=1
+                ;;
+            esac
+          done
+          if [ "$BAD" -ne 0 ]; then
+            echo "::error::PR author '${AUTHOR}' may only touch '${PREFIX}'."
+            exit 1
+          fi
+          echo "OK: all changed files are under '${PREFIX}'."
+
+  merge:
+    name: Auto-merge PR
+    needs: scope
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.draft == false }}
+    steps:
+      - name: Merge pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
