@@ -1,70 +1,313 @@
-name: Validate PR Scope and Auto-Merge
+name: Validate PR and Auto-Merge
 
 on:
   pull_request:
     branches: [main]
 
 permissions:
-  contents: write        # 合并 PR 需要
-  pull-requests: write   # 批准/操作 PR 需要
+  contents: write        # merge PR and push generated lib.json
+  pull-requests: write   # comment on PR and merge PR
+
+env:
+  CI: true
 
 jobs:
-  scope:
-    name: Check PR only touches libs/${{ github.event.pull_request.user.login }}/
+  validate:
+    name: Validate PR scope and structure
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR head with full history
+      - name: Checkout (same-repo PR)
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          # A PAT is only needed when branch protection requires status checks
+          # on the new commit created by the lib.json sync below.
+          token: ${{ secrets.AUTO_MERGE_TOKEN || github.token }}
+
+      - name: Checkout (fork PR)
+        if: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: actions/checkout@v4
+        with:
           fetch-depth: 0
 
-      - name: Validate changed paths
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate paths, structure, and sync lib.json
+        id: check
         shell: bash
         env:
           AUTHOR: ${{ github.event.pull_request.user.login }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          ERRORS_FILE: ${{ runner.temp }}/errors.txt
         run: |
           set -euo pipefail
           git fetch origin "$BASE_REF"
-          MERGE_BASE=$(git merge-base "origin/$BASE_REF" HEAD)
-          mapfile -t FILES < <(git diff --name-only --no-renames "$MERGE_BASE" HEAD)
 
-          if [ "${#FILES[@]}" -eq 0 ]; then
-            echo "::error::This PR contains no file changes."
-            exit 1
+          python3 - <<'PY'
+          import os, sys, json, subprocess
+
+          AUTHOR = os.environ["AUTHOR"]
+          BASE_REF = os.environ["BASE_REF"]
+          SAME_REPO = os.environ["SAME_REPO"] == "true"
+          HEAD_SHA = os.environ["HEAD_SHA"]
+          ERRORS_FILE = os.environ["ERRORS_FILE"]
+
+          errors = []
+
+          def err(msg):
+              print(f"::error::{msg}", flush=True)
+              errors.append(msg)
+
+          def flush_and_exit():
+              if errors:
+                  with open(ERRORS_FILE, "w", encoding="utf-8") as fp:
+                      fp.write("\n".join(errors))
+                  sys.exit(1)
+              # success: remove any stale error report
+              try:
+                  os.remove(ERRORS_FILE)
+              except FileNotFoundError:
+                  pass
+              sys.exit(0)
+
+          target = "HEAD" if SAME_REPO else HEAD_SHA
+          diff_range = f"origin/{BASE_REF}...{target}"
+          files = [
+              f for f in subprocess.check_output(
+                  ["git", "diff", "--name-only", "--no-renames", diff_range], text=True
+              ).splitlines() if f
+          ]
+          if not files:
+              err("The pull request contains no file changes.")
+              flush_and_exit()
+
+          PREFIX = f"libs/{AUTHOR}/"
+          lib_dirs = set()
+          for f in files:
+              if not f.startswith(PREFIX):
+                  err(f"'{f}' is outside the allowed directory '{PREFIX}'.")
+                  continue
+              parts = f[len(PREFIX):].split("/")
+              if len(parts) < 2:
+                  err(f"'{f}' must be placed under '{PREFIX}<library>/'.")
+                  continue
+              lib_dirs.add(f"{PREFIX}{parts[0]}")
+
+          FIELDS = ["Name", "Author", "Version", "Description", "Link", "License"]
+
+          try:
+              import tomllib
+          except ImportError:
+              import tomli as tomllib
+
+          def normalize(data, where):
+              lowered = {str(k).lower(): v for k, v in data.items()}
+              out = {}
+              for field in FIELDS:
+                  key = field.lower()
+                  if key not in lowered:
+                      err(f"{where}: missing required field '{field}'.")
+                      continue
+                  value = lowered[key]
+                  if value is None or (isinstance(value, str) and not value.strip()):
+                      err(f"{where}: field '{field}' is empty.")
+                      continue
+                  out[field] = value
+              return out
+
+          pending_writes = []
+          for lib in sorted(lib_dirs):
+              if not os.path.isdir(lib):
+                  # whole library directory was removed; nothing to validate
+                  continue
+
+              entries = os.listdir(lib)
+              if not any(e == "LICENSE" or e.startswith("LICENSE.") for e in entries):
+                  err(f"{lib}: missing 'LICENSE' file.")
+
+              toml_path = os.path.join(lib, "lib.toml")
+              json_path = os.path.join(lib, "lib.json")
+              has_toml = os.path.isfile(toml_path)
+              has_json = os.path.isfile(json_path)
+              if not has_toml and not has_json:
+                  err(f"{lib}: missing 'lib.toml' or 'lib.json'.")
+                  continue
+
+              toml_data = None
+              json_data = None
+              if has_toml:
+                  with open(toml_path, "rb") as fp:
+                      try:
+                          toml_data = normalize(tomllib.load(fp), f"{lib}/lib.toml")
+                      except Exception as exc:
+                          err(f"{lib}/lib.toml: failed to parse ({exc}).")
+              if has_json:
+                  with open(json_path, encoding="utf-8") as fp:
+                      try:
+                          json_data = normalize(json.load(fp), f"{lib}/lib.json")
+                      except Exception as exc:
+                          err(f"{lib}/lib.json: failed to parse ({exc}).")
+
+              # lib.toml is the source of truth for lib.json
+              if toml_data is not None and (json_data is None or json_data != toml_data):
+                  pending_writes.append((json_path, toml_data))
+
+          # Only write files when every check passed.
+          if not errors:
+              for path, data in pending_writes:
+                  with open(path, "w", encoding="utf-8") as fp:
+                      fp.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+                  print(f"Generated: {path}")
+
+          flush_and_exit()
+          PY
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Changes detected after lib.json sync:"
+            git --no-pager status --short
+            if [ "$SAME_REPO" != "true" ]; then
+              {
+                echo "lib.json needs to be generated, but this pull request comes from a fork."
+                echo "Please run the conversion locally and commit the result."
+              } > "$ERRORS_FILE"
+              echo "::error::Cannot push generated lib.json to a fork."
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A -- libs/
+            git commit -m "chore: sync lib.json from lib.toml"
+            git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          else
+            echo "No lib.json changes needed."
           fi
 
-          PREFIX="libs/${AUTHOR}/"
-          BAD=0
-          for f in "${FILES[@]}"; do
-            echo "Changed: $f"
-            case "$f" in
-              "$PREFIX"*) ;;
-              *)
-                echo "::error file=$f::'$f' is outside '${PREFIX}'."
-                BAD=1
-                ;;
-            esac
-          done
-          if [ "$BAD" -ne 0 ]; then
-            echo "::error::PR author '${AUTHOR}' may only touch '${PREFIX}'."
-            exit 1
-          fi
-          echo "OK: all changed files are under '${PREFIX}'."
-
-  merge:
-    name: Auto-merge PR
-    needs: scope
-    runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false }}
-    steps:
-      - name: Merge pull request
+      - name: Report validation result
+        if: always()
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ steps.check.outcome }}
+          ERRORS_FILE: ${{ runner.temp }}/errors.txt
+        run: |
+          set -euo pipefail
+          MARKER="<!-- vortex-libs-validator -->"
+          BODY_FILE="$RUNNER_TEMP/comment.md"
+
+          if [ "$RESULT" = "success" ]; then
+            cat > "$BODY_FILE" <<EOF
+          ${MARKER}
+          ## ✅ Vortex-libs PR validation passed
+
+          All changed files are within your own library directory, the layout matches the
+          [documented structure](https://github.com/$REPO#how-to-use), and \`lib.json\`
+          is in sync with \`lib.toml\`. This pull request will be merged automatically.
+          EOF
+          else
+            {
+              echo "$MARKER"
+              echo "## ❌ Vortex-libs PR validation failed"
+              echo
+              echo "This pull request does not meet the repository requirements."
+              echo "Please fix the issues below and push again."
+              echo
+              if [ -f "$ERRORS_FILE" ] && [ -s "$ERRORS_FILE" ]; then
+                echo "### Errors"
+                echo
+                while IFS= read -r line; do
+                  [ -n "$line" ] && echo "- $line"
+                done < "$ERRORS_FILE"
+                echo
+              else
+                echo "The validator did not produce a detailed error report."
+                echo "Check the job log for more information."
+                echo
+              fi
+              cat <<'EOF'
+
+          ### Requirements
+
+          - All changes must be under `libs/<your-github-username>/`.
+          - Each library must live in `libs/<your-github-username>/<library-name>/`.
+          - The library directory must contain `LICENSE` and either `lib.toml` or `lib.json`.
+          - `lib.toml` / `lib.json` must define `Name`, `Author`, `Version`,
+            `Description`, `Link`, and `License`.
+          - `lib.json` is generated from `lib.toml` automatically.
+          EOF
+            } > "$BODY_FILE"
+          fi
+
+          COMMENT_ID=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/$REPO/issues/$PR/comments/$COMMENT_ID" \
+              -F body=@"$BODY_FILE" >/dev/null
+            echo "Updated existing validation comment."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" \
+              -F body=@"$BODY_FILE" >/dev/null
+            echo "Created validation comment."
+          fi
+
+  merge:
+    name: Auto-merge PR
+    needs: validate
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.pull_request.draft }}
+    steps:
+      - name: Merge pull request
+        id: merge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$SAME_REPO" = "true" ]; then
+            gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
+          else
+            # The head branch of a fork PR belongs to the fork; only merge.
+            gh pr merge "$PR" --repo "$REPO" --squash
+          fi
+
+      - name: Report merge failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
+          MARKER="<!-- vortex-libs-merge -->"
+          BODY_FILE="$RUNNER_TEMP/merge-comment.md"
+          cat > "$BODY_FILE" <<EOF
+          ${MARKER}
+          ## ⚠️ Auto-merge failed
+
+          Validation passed, but the automatic merge could not be completed.
+          This usually means the branch is out of date, has merge conflicts,
+          or is blocked by branch protection rules. Please resolve it manually.
+          EOF
+
+          COMMENT_ID=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/$REPO/issues/$PR/comments/$COMMENT_ID" \
+              -F body=@"$BODY_FILE" >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" \
+              -F body=@"$BODY_FILE" >/dev/null
+          fi
