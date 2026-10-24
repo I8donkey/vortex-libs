@@ -50,7 +50,7 @@ jobs:
           set -euo pipefail
           git fetch origin "$BASE_REF"
 
-          python3 - <<'PY'
+                    python3 - <<'PY'
           import os, sys, json, subprocess
 
           AUTHOR = os.environ["AUTHOR"]
@@ -70,7 +70,6 @@ jobs:
                   with open(ERRORS_FILE, "w", encoding="utf-8") as fp:
                       fp.write("\n".join(errors))
                   sys.exit(1)
-              # success: remove any stale error report
               try:
                   os.remove(ERRORS_FILE)
               except FileNotFoundError:
@@ -89,16 +88,24 @@ jobs:
               flush_and_exit()
 
           PREFIX = f"libs/{AUTHOR}/"
+          PREFIX_LOWER = PREFIX.lower()
+          
           lib_dirs = set()
           for f in files:
-              if not f.startswith(PREFIX):
+              if not f.lower().startswith(PREFIX_LOWER):
                   err(f"'{f}' is outside the allowed directory '{PREFIX}'.")
                   continue
-              parts = f[len(PREFIX):].split("/")
+              
+              # 为了兼容大小写，截取时使用基于长度的切片
+              rel_path = f[len(PREFIX):]
+              parts = rel_path.split("/")
               if len(parts) < 2:
                   err(f"'{f}' must be placed under '{PREFIX}<library>/'.")
                   continue
-              lib_dirs.add(f"{PREFIX}{parts[0]}")
+              
+              # 保留实际文件路径的大小写
+              real_prefix = f[:len(PREFIX)]
+              lib_dirs.add(f"{real_prefix}{parts[0]}")
 
           FIELDS = ["Name", "Author", "Version", "Description", "Link", "License"]
 
@@ -125,7 +132,6 @@ jobs:
           pending_writes = []
           for lib in sorted(lib_dirs):
               if not os.path.isdir(lib):
-                  # whole library directory was removed; nothing to validate
                   continue
 
               entries = os.listdir(lib)
@@ -155,11 +161,9 @@ jobs:
                       except Exception as exc:
                           err(f"{lib}/lib.json: failed to parse ({exc}).")
 
-              # lib.toml is the source of truth for lib.json
               if toml_data is not None and (json_data is None or json_data != toml_data):
                   pending_writes.append((json_path, toml_data))
 
-          # Only write files when every check passed.
           if not errors:
               for path, data in pending_writes:
                   with open(path, "w", encoding="utf-8") as fp:
@@ -168,26 +172,6 @@ jobs:
 
           flush_and_exit()
           PY
-
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "Changes detected after lib.json sync:"
-            git --no-pager status --short
-            if [ "$SAME_REPO" != "true" ]; then
-              {
-                echo "lib.json needs to be generated, but this pull request comes from a fork."
-                echo "Please run the conversion locally and commit the result."
-              } > "$ERRORS_FILE"
-              echo "::error::Cannot push generated lib.json to a fork."
-              exit 1
-            fi
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -A -- libs/
-            git commit -m "chore: sync lib.json from lib.toml"
-            git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
-          else
-            echo "No lib.json changes needed."
-          fi
 
       - name: Report validation result
         if: always()
