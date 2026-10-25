@@ -6,9 +6,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
-
   validate:
     name: Validate & Sync
     if: ${{ !github.event.pull_request.draft }}
@@ -20,10 +20,12 @@ jobs:
           ref: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || '' }}
           fetch-depth: 0
           ssh-key: ${{ secrets.DEPLOY_KEY }}
+      
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          
       - name: Check and generate
         id: check
         shell: bash
@@ -36,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch origin "$BASE_REF"
-
+          
           python3 - <<'PY'
           import os, sys, json, subprocess, tomllib
           author, base_ref = os.environ["AUTHOR"], os.environ["BASE_REF"]
@@ -57,17 +59,17 @@ jobs:
               libs.add(f"{f[:len(prefix)]}{parts[0]}")
           FIELDS = ["name", "author", "version", "description", "link", "license"]
           to_write = []
-
+          
           for lib in libs:
               if not os.path.isdir(lib):
                   print(f"::warning::{lib}: directory not found on disk, skip.")
                   continue
               if not any(e.startswith("LICENSE") for e in os.listdir(lib)): err(f"{lib}: missing LICENSE.")
-
+              
               tp, jp = os.path.join(lib, "lib.toml"), os.path.join(lib, "lib.json")
               has_t, has_j = os.path.isfile(tp), os.path.isfile(jp)
               if not has_t and not has_j: err(f"{lib}: missing lib.toml/json."); continue
-
+              
               def norm(d, where):
                   low = {k.lower(): v for k, v in d.items()}
                   out = {f: low[f] for f in FIELDS if f in low and str(low[f]).strip()}
@@ -101,6 +103,7 @@ jobs:
               json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
               print(f"::notice::Wrote {p}")
           PY
+          
           if [ -n "$(git status --porcelain)" ]; then
             if [ "$SAME_REPO" != "true" ]; then
               echo "Fork PR cannot auto-generate lib.json." > "$ERR_FILE"
@@ -113,40 +116,34 @@ jobs:
             git commit -m "chore: sync lib.json"
             git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
           fi
+
       - name: Comment result
         if: always()
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}  # 回归默认 token，同仓库完全够用
           PR: ${{ github.event.pull_request.number }}
           RESULT: ${{ steps.check.outcome }}
           ERR_FILE: ${{ runner.temp }}/errors.txt
         run: |
-          echo "::group::gh auth status"
-          gh auth status || true
-          echo "::endgroup::"
-
-          MARKER="<!-- vortex-libs-validator -->"
           BODY="$RUNNER_TEMP/comment.md"
-
+          
           if [ "$RESULT" = "success" ]; then
-            printf '%s\n## ✅ Validation passed\n\nAll checks passed and `lib.json` is in sync. Merging automatically.\n' "$MARKER" > "$BODY"
+            printf '## ✅ Validation passed\n\nAll checks passed and `lib.json` is in sync. Merging automatically.\n' > "$BODY"
           else
-            printf '%s\n## ❌ Validation failed\n\nPlease fix the issues and push again.\n\n### Errors\n' "$MARKER" > "$BODY"
+            printf '## ❌ Validation failed\n\nPlease fix the issues and push again.\n\n### Errors\n' > "$BODY"
             if [ -s "$ERR_FILE" ]; then sed 's/^/- /' "$ERR_FILE" >> "$BODY"; else echo "- Check job logs." >> "$BODY"; fi
             cat <<'EOF' >> "$BODY"
+          
           ### Requirements
           - Path must be `libs/<username>/<library>/`
           - Must include `LICENSE` and `lib.toml` or `lib.json`
           - Fields: `Name`, `Author`, `Version`, `Description`, `Link`, `License`
           EOF
           fi
-          ID=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)
-          if [ -n "$ID" ]; then
-            gh api -X PATCH "repos/${{ github.repository }}/issues/$PR/comments/$ID" -F body=@"$BODY" >/dev/null
-          else
-            gh api -X POST "repos/${{ github.repository }}/issues/$PR/comments" -F body=@"$BODY" >/dev/null
-          fi
+          
+          # 使用原生的 gh pr comment，彻底告别 404 和复杂转义
+          gh pr comment "$PR" --repo "${{ github.repository }}" --body-file "$BODY"
 
   merge:
     name: Auto-Merge
@@ -157,18 +154,13 @@ jobs:
       - name: Merge PR
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
-          echo "::group::gh auth status"
-          gh auth status || true
-          echo "::endgroup::"
           echo "::group::PR state"
           gh pr view "$PR" --repo "${{ github.repository }}" --json state,mergeable,mergeStateStatus || true
           echo "::endgroup::"
-          if [ "$SAME_REPO" = "true" ]; then
-            gh pr merge "$PR" --repo "${{ github.repository }}" --squash --delete-branch
-          else
-            gh pr merge "$PR" --repo "${{ github.repository }}" --squash
-          fi
+          
+          # 使用 --auto 解决 Required Status Checks 带来的死锁
+          # --auto 会在当前 check 跑完并显示 success 后，自动执行合并
+          gh pr merge "$PR" --repo "${{ github.repository }}" --squash --auto --delete-branch
