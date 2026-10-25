@@ -9,30 +9,9 @@ permissions:
   issues: write
 
 jobs:
-  check-author-admin:
-    name: Check PR author is admin
-    runs-on: ubuntu-latest
-    outputs:
-      is_admin: ${{ steps.check.outputs.is_admin }}
-    steps:
-      - name: Check admin permission
-        id: check
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const login = context.payload.pull_request.user.login;
-            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              username: login
-            });
-            const isAdmin = data.permission === 'admin';
-            core.setOutput('is_admin', isAdmin.toString());
-            core.info(`Author ${login}, permission=${data.permission}, is_admin=${isAdmin}`);
 
   validate:
     name: Validate & Sync
-    needs: check-author-admin
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
@@ -41,7 +20,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || '' }}
           fetch-depth: 0
-          token: ${{ secrets.AUTO_MERGE_TOKEN || github.token }}
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
