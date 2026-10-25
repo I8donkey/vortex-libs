@@ -32,7 +32,7 @@ jobs:
   validate:
     name: Validate & Sync
     needs: check-author-admin
-    if: ${{ needs.check-author-admin.outputs.is_admin != 'true' && !github.event.pull_request.draft }}
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -80,7 +80,9 @@ jobs:
           to_write = []
           
           for lib in libs:
-              if not os.path.isdir(lib): continue
+              if not os.path.isdir(lib):
+                  print(f"::warning::{lib}: directory not found on disk, skip.")
+                  continue
               if not any(e.startswith("LICENSE") for e in os.listdir(lib)): err(f"{lib}: missing LICENSE.")
               
               tp, jp = os.path.join(lib, "lib.toml"), os.path.join(lib, "lib.json")
@@ -95,17 +97,30 @@ jobs:
                   return out
               t_data = j_data = None
               if has_t:
-                  try: t_data = norm(tomllib.load(open(tp, "rb")), f"{lib}/lib.toml")
+                  try:
+                      t_data = norm(tomllib.load(open(tp, "rb")), f"{lib}/lib.toml")
+                      print(f"::notice::{lib}: parsed lib.toml -> {t_data}")
                   except Exception as e: err(f"{lib}/lib.toml: parse error ({e}).")
               if has_j:
-                  try: j_data = norm(json.load(open(jp, encoding="utf-8")), f"{lib}/lib.json")
+                  try:
+                      j_data = norm(json.load(open(jp, encoding="utf-8")), f"{lib}/lib.json")
                   except Exception as e: err(f"{lib}/lib.json: parse error ({e}).")
-              if t_data and t_data != j_data: to_write.append((jp, t_data))
+              if t_data is not None:
+                  if t_data != j_data:
+                      to_write.append((jp, t_data))
+                      print(f"::notice::{lib}: lib.json will be (re)generated from lib.toml")
+                  else:
+                      print(f"::notice::{lib}: lib.json already in sync")
+              else:
+                  print(f"::notice::{lib}: no valid lib.toml, nothing to generate")
           if errors:
               open(err_file, "w").write("\n".join(errors))
+              print("::error::Validation failed; lib.json will NOT be written.")
               sys.exit(1)
           for p, d in to_write:
+              os.makedirs(os.path.dirname(p), exist_ok=True)
               json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+              print(f"::notice::Wrote {p}")
           PY
           if [ -n "$(git status --porcelain)" ]; then
             if [ "$SAME_REPO" != "true" ]; then
@@ -153,7 +168,7 @@ jobs:
   merge:
     name: Auto-Merge
     needs: [check-author-admin, validate]
-    if: ${{ !github.event.pull_request.draft && ( needs.check-author-admin.outputs.is_admin == 'true' || needs.validate.result == 'success' ) }}
+    if: ${{ !github.event.pull_request.draft && needs.validate.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Merge PR
