@@ -1,6 +1,6 @@
 Name = "Example"
 Author = "i8donkey   the author of vortex"
-Version = "v1.0.0"
+Version = "v1.0.1"
 Description = "this is only a examle library.there is nothing here"
 Link = "https://www.github.com/i8donkey/vortex-lib-example.git"
 License = "GNU Lesser General Public License v3.0"
