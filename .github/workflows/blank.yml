@@ -147,7 +147,7 @@ jobs:
 
   merge:
     name: Auto-Merge
-    needs: [check-author-admin, validate]
+    needs: [validate]
     if: ${{ !github.event.pull_request.draft && needs.validate.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
