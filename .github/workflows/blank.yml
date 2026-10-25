@@ -121,7 +121,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}  # 回归默认 token，同仓库完全够用
+          GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           RESULT: ${{ steps.check.outcome }}
           ERR_FILE: ${{ runner.temp }}/errors.txt
@@ -142,7 +142,7 @@ jobs:
           EOF
           fi
           
-          # 使用原生的 gh pr comment，彻底告别 404 和复杂转义
+          # 直接调用 gh pr comment，由 gh CLI 内部处理所有复杂的 API 逻辑
           gh pr comment "$PR" --repo "${{ github.repository }}" --body-file "$BODY"
 
   merge:
@@ -161,6 +161,6 @@ jobs:
           gh pr view "$PR" --repo "${{ github.repository }}" --json state,mergeable,mergeStateStatus || true
           echo "::endgroup::"
           
-          # 使用 --auto 解决 Required Status Checks 带来的死锁
-          # --auto 会在当前 check 跑完并显示 success 后，自动执行合并
+          # 由于该 actions 是 required status check，直接 merge 会死锁
+          # 使用 --auto 表示：一旦当前 check 跑完并显示 success，立刻自动合并
           gh pr merge "$PR" --repo "${{ github.repository }}" --squash --auto --delete-branch
