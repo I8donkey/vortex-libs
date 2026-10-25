@@ -137,11 +137,11 @@ jobs:
             printf '%s\n## ❌ Validation failed\n\nPlease fix the issues and push again.\n\n### Errors\n' "$MARKER" > "$BODY"
             if [ -s "$ERR_FILE" ]; then sed 's/^/- /' "$ERR_FILE" >> "$BODY"; else echo "- Check job logs." >> "$BODY"; fi
             cat <<'EOF' >> "$BODY"
-### Requirements
-- Path must be `libs/<username>/<library>/`
-- Must include `LICENSE` and `lib.toml` or `lib.json`
-- Fields: `Name`, `Author`, `Version`, `Description`, `Link`, `License`
-EOF
+          ### Requirements
+          - Path must be `libs/<username>/<library>/`
+          - Must include `LICENSE` and `lib.toml` or `lib.json`
+          - Fields: `Name`, `Author`, `Version`, `Description`, `Link`, `License`
+          EOF
           fi
           ID=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)
           if [ -n "$ID" ]; then
@@ -153,12 +153,7 @@ EOF
   merge:
     name: Auto-Merge
     needs: [check-author-admin, validate]
-    if: |
-      !github.event.pull_request.draft
-      && (
-        needs.check-author-admin.outputs.is_admin == 'true'
-        || needs.validate.result == 'success'
-      )
+    if: ${{ !github.event.pull_request.draft && ( needs.check-author-admin.outputs.is_admin == 'true' || needs.validate.result == 'success' ) }}
     runs-on: ubuntu-latest
     steps:
       - name: Merge PR
