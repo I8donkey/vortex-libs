@@ -2,12 +2,10 @@ name: Validate & Merge
 on:
   pull_request:
     types: [opened, synchronize]
-
 permissions:
   contents: write
   pull-requests: write
   issues: write
-
 jobs:
   validate:
     name: Validate & Sync
@@ -20,12 +18,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || '' }}
           fetch-depth: 0
           ssh-key: ${{ secrets.DEPLOY_KEY }}
-      
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          
       - name: Check and generate
         id: check
         shell: bash
@@ -38,85 +30,53 @@ jobs:
         run: |
           set -euo pipefail
           git fetch origin "$BASE_REF"
-          
           python3 - <<'PY'
           import os, sys, json, subprocess, tomllib
-          author, base_ref = os.environ["AUTHOR"], os.environ["BASE_REF"]
-          same_repo = os.environ["SAME_REPO"] == "true"
-          head_sha = os.environ["HEAD_SHA"]
-          err_file = os.environ["ERR_FILE"]
-          errors = []
-          def err(m): errors.append(m); print(f"::error::{m}")
-          diff_range = f"origin/{base_ref}...{'HEAD' if same_repo else head_sha}"
-          files = subprocess.check_output(["git", "diff", "--name-only", "--no-renames", diff_range], text=True).splitlines()
-          if not files: err("PR contains no file changes.")
-          prefix = f"libs/{author}/".lower()
-          libs = set()
+          errs, libs, to_write = [], set(), []
+          def err(m): errs.append(m); print(f"::error::{m}")
+          base, head = os.environ["BASE_REF"], os.environ["HEAD_SHA"] if os.environ["SAME_REPO"] != "true" else "HEAD"
+          files = subprocess.check_output(["git", "diff", "--name-only", "--no-renames", f"origin/{base}...{head}"], text=True).splitlines()
+          if not files: err("PR contains no changes.")
+          prefix = f"libs/{os.environ['AUTHOR']}/".lower()
           for f in files:
               if not f.lower().startswith(prefix): err(f"'{f}' is outside '{prefix}'."); continue
               parts = f[len(prefix):].split("/")
               if len(parts) < 2: err(f"'{f}' must be under '{prefix}<lib>/'."); continue
               libs.add(f"{f[:len(prefix)]}{parts[0]}")
           FIELDS = ["name", "author", "version", "description", "link", "license"]
-          to_write = []
-          
-          for lib in libs:
-              if not os.path.isdir(lib):
-                  print(f"::warning::{lib}: directory not found on disk, skip.")
-                  continue
-              if not any(e.startswith("LICENSE") for e in os.listdir(lib)): err(f"{lib}: missing LICENSE.")
-              
-              tp, jp = os.path.join(lib, "lib.toml"), os.path.join(lib, "lib.json")
-              has_t, has_j = os.path.isfile(tp), os.path.isfile(jp)
-              if not has_t and not has_j: err(f"{lib}: missing lib.toml/json."); continue
-              
-              def norm(d, where):
+          get_mtime = lambda p: int(subprocess.check_output(["git", "log", "-1", "--format=%ct", "--", p], text=True, stderr=subprocess.DEVNULL).strip() or 0)
+          def load(p, is_toml):
+              try:
+                  d = tomllib.load(open(p, "rb")) if is_toml else json.load(open(p, encoding="utf-8"))
                   low = {k.lower(): v for k, v in d.items()}
                   out = {f: low[f] for f in FIELDS if f in low and str(low[f]).strip()}
                   for f in FIELDS:
-                      if f not in out: err(f"{where}: missing/empty '{f}'.")
+                      if f not in out: err(f"{p}: missing/empty '{f}'.")
                   return out
-              t_data = j_data = None
-              if has_t:
-                  try:
-                      t_data = norm(tomllib.load(open(tp, "rb")), f"{lib}/lib.toml")
-                      print(f"::notice::{lib}: parsed lib.toml -> {t_data}")
-                  except Exception as e: err(f"{lib}/lib.toml: parse error ({e}).")
-              if has_j:
-                  try:
-                      j_data = norm(json.load(open(jp, encoding="utf-8")), f"{lib}/lib.json")
-                  except Exception as e: err(f"{lib}/lib.json: parse error ({e}).")
-              if t_data is not None:
-                  if t_data != j_data:
-                      to_write.append((jp, t_data))
-                      print(f"::notice::{lib}: lib.json will be (re)generated from lib.toml")
-                  else:
-                      print(f"::notice::{lib}: lib.json already in sync")
-              else:
-                  print(f"::notice::{lib}: no valid lib.toml, nothing to generate")
-          if errors:
-              open(err_file, "w").write("\n".join(errors))
-              print("::error::Validation failed; lib.json will NOT be written.")
+              except Exception as e: err(f"{p}: parse error ({e}).")
+          for lib in libs:
+              if not os.path.isdir(lib): continue
+              if not any(e.startswith("LICENSE") for e in os.listdir(lib)): err(f"{lib}: missing LICENSE.")
+              tp, jp = os.path.join(lib, "lib.toml"), os.path.join(lib, "lib.json")
+              has_t, has_j = os.path.isfile(tp), os.path.isfile(jp)
+              if not has_t and not has_j: err(f"{lib}: missing lib.toml/json."); continue
+              t_data = load(tp, True) if has_t else None
+              j_data = load(jp, False) if has_j else None
+              src = t_data if (t_data and j_data and get_mtime(tp) >= get_mtime(jp)) else (j_data if j_data else t_data)
+              if src and src != j_data: to_write.append((jp, src))
+          if errs:
+              open(os.environ["ERR_FILE"], "w").write("\n".join(errs))
               sys.exit(1)
           for p, d in to_write:
-              os.makedirs(os.path.dirname(p), exist_ok=True)
               json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
               print(f"::notice::Wrote {p}")
           PY
-          
           if [ -n "$(git status --porcelain)" ]; then
-            if [ "$SAME_REPO" != "true" ]; then
-              echo "Fork PR cannot auto-generate lib.json." > "$ERR_FILE"
-              echo "::error::Cannot push to a fork."
-              exit 1
-            fi
+            [ "$SAME_REPO" != "true" ] && echo "Fork PR cannot auto-generate." > "$ERR_FILE" && exit 1
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add libs/
-            git commit -m "chore: sync lib.json"
-            git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+            git add libs/ && git commit -m "chore: sync lib.json" && git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
           fi
-
       - name: Comment result
         if: always()
         shell: bash
@@ -126,25 +86,15 @@ jobs:
           RESULT: ${{ steps.check.outcome }}
           ERR_FILE: ${{ runner.temp }}/errors.txt
         run: |
-          BODY="$RUNNER_TEMP/comment.md"
-          
+          BODY="$RUNNER_TEMP/c.md"
           if [ "$RESULT" = "success" ]; then
             printf '## ✅ Validation passed\n\nAll checks passed and `lib.json` is in sync. Merging automatically.\n' > "$BODY"
           else
-            printf '## ❌ Validation failed\n\nPlease fix the issues and push again.\n\n### Errors\n' > "$BODY"
-            if [ -s "$ERR_FILE" ]; then sed 's/^/- /' "$ERR_FILE" >> "$BODY"; else echo "- Check job logs." >> "$BODY"; fi
-            cat <<'EOF' >> "$BODY"
-          
-          ### Requirements
-          - Path must be `libs/<username>/<library>/`
-          - Must include `LICENSE` and `lib.toml` or `lib.json`
-          - Fields: `Name`, `Author`, `Version`, `Description`, `Link`, `License`
-          EOF
+            printf '## ❌ Validation failed\n\nPlease fix the issues.\n\n### Errors\n' > "$BODY"
+            [ -s "$ERR_FILE" ] && sed 's/^/- /' "$ERR_FILE" >> "$BODY" || echo "- Check logs." >> "$BODY"
+            printf '\n### Requirements\n- Path: `libs/<username>/<library>/`\n- Include `LICENSE` & `lib.toml` or `lib.json`\n- Fields: `Name`, `Author`, `Version`, `Description`, `Link`, `License`\n' >> "$BODY"
           fi
-          
-          # 直接调用 gh pr comment，由 gh CLI 内部处理所有复杂的 API 逻辑
           gh pr comment "$PR" --repo "${{ github.repository }}" --body-file "$BODY"
-
   merge:
     name: Auto-Merge
     needs: [validate]
@@ -156,11 +106,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-        run: |
-          echo "::group::PR state"
-          gh pr view "$PR" --repo "${{ github.repository }}" --json state,mergeable,mergeStateStatus || true
-          echo "::endgroup::"
-          
-          # 由于该 actions 是 required status check，直接 merge 会死锁
-          # 使用 --auto 表示：一旦当前 check 跑完并显示 success，立刻自动合并
-          gh pr merge "$PR" --repo "${{ github.repository }}" --squash --auto --delete-branch
+        run: gh pr merge "$PR" --repo "${{ github.repository }}" --squash --auto --delete-branch
