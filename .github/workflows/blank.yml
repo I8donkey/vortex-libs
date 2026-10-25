@@ -1,15 +1,38 @@
 name: Validate & Merge
 on:
   pull_request:
-    branches: [main]
+    types: [opened, synchronize]
 
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
+  check-author-admin:
+    name: Check PR author is admin
+    runs-on: ubuntu-latest
+    outputs:
+      is_admin: ${{ steps.check.outputs.is_admin }}
+    steps:
+      - name: Check admin permission
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const login = context.payload.pull_request.user.login;
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: login
+            });
+            const isAdmin = data.permission === 'admin';
+            core.setOutput('is_admin', isAdmin.toString());
+            core.info(`Author ${login}, permission=${data.permission}, is_admin=${isAdmin}`);
+
   validate:
     name: Validate & Sync
+    needs: check-author-admin
+    if: ${{ needs.check-author-admin.outputs.is_admin != 'true' && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,12 +41,10 @@ jobs:
           ref: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || '' }}
           fetch-depth: 0
           token: ${{ secrets.AUTO_MERGE_TOKEN || github.token }}
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Check and generate
         id: check
         shell: bash
@@ -39,18 +60,15 @@ jobs:
           
           python3 - <<'PY'
           import os, sys, json, subprocess, tomllib
-
           author, base_ref = os.environ["AUTHOR"], os.environ["BASE_REF"]
           same_repo = os.environ["SAME_REPO"] == "true"
           head_sha = os.environ["HEAD_SHA"]
           err_file = os.environ["ERR_FILE"]
           errors = []
           def err(m): errors.append(m); print(f"::error::{m}")
-
           diff_range = f"origin/{base_ref}...{'HEAD' if same_repo else head_sha}"
           files = subprocess.check_output(["git", "diff", "--name-only", "--no-renames", diff_range], text=True).splitlines()
           if not files: err("PR contains no file changes.")
-
           prefix = f"libs/{author}/".lower()
           libs = set()
           for f in files:
@@ -58,7 +76,6 @@ jobs:
               parts = f[len(prefix):].split("/")
               if len(parts) < 2: err(f"'{f}' must be under '{prefix}<lib>/'."); continue
               libs.add(f"{f[:len(prefix)]}{parts[0]}")
-
           FIELDS = ["name", "author", "version", "description", "link", "license"]
           to_write = []
           
@@ -76,7 +93,6 @@ jobs:
                   for f in FIELDS:
                       if f not in out: err(f"{where}: missing/empty '{f}'.")
                   return out
-
               t_data = j_data = None
               if has_t:
                   try: t_data = norm(tomllib.load(open(tp, "rb")), f"{lib}/lib.toml")
@@ -84,16 +100,13 @@ jobs:
               if has_j:
                   try: j_data = norm(json.load(open(jp, encoding="utf-8")), f"{lib}/lib.json")
                   except Exception as e: err(f"{lib}/lib.json: parse error ({e}).")
-
               if t_data and t_data != j_data: to_write.append((jp, t_data))
-
           if errors:
               open(err_file, "w").write("\n".join(errors))
               sys.exit(1)
           for p, d in to_write:
               json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-
           if [ -n "$(git status --porcelain)" ]; then
             if [ "$SAME_REPO" != "true" ]; then
               echo "Fork PR cannot auto-generate lib.json." > "$ERR_FILE"
@@ -106,7 +119,6 @@ jobs:
             git commit -m "chore: sync lib.json"
             git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
           fi
-
       - name: Comment result
         if: always()
         shell: bash
@@ -125,14 +137,12 @@ jobs:
             printf '%s\n## ❌ Validation failed\n\nPlease fix the issues and push again.\n\n### Errors\n' "$MARKER" > "$BODY"
             if [ -s "$ERR_FILE" ]; then sed 's/^/- /' "$ERR_FILE" >> "$BODY"; else echo "- Check job logs." >> "$BODY"; fi
             cat <<'EOF' >> "$BODY"
-
           ### Requirements
           - Path must be `libs/<username>/<library>/`
           - Must include `LICENSE` and `lib.toml` or `lib.json`
           - Fields: `Name`, `Author`, `Version`, `Description`, `Link`, `License`
           EOF
           fi
-
           ID=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)
           if [ -n "$ID" ]; then
             gh api -X PATCH "repos/${{ github.repository }}/issues/$PR/comments/$ID" -F body=@"$BODY" >/dev/null
@@ -142,9 +152,9 @@ jobs:
 
   merge:
     name: Auto-Merge
-    needs: validate
+    needs: [check-author-admin, validate]
+    if: ${{ !github.event.pull_request.draft && ( needs.check-author-admin.outputs.is_admin == 'true' || needs.validate.result == 'success' ) }}
     runs-on: ubuntu-latest
-    if: ${{ !github.event.pull_request.draft }}
     steps:
       - name: Merge PR
         shell: bash
