@@ -37,5 +37,13 @@ Description = "..."
 Link = "https://www.github.com/xxx/xxx.git（同上）"
 License = "..."
 ```
-4. 将你的库推送到https://www.github.com/xxx/xxx.git
+4. 将你的库推送到https://www.github.com/xxx/xxx.git（按照以下格式）
+```
+src/
+    main.vt
+    xxx.vt
+    ...
+...
+LICENSE
+```
 5. 发起PR
