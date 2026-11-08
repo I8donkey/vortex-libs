@@ -1,8 +1,8 @@
 {
-  "name": "Example",
+  "name": "Fraction",
   "author": "i8donkey   the author of vortex",
-  "version": "v1.0.1",
-  "description": "this is only a examle library.there is nothing here",
-  "link": "https://www.github.com/i8donkey/vortex-lib-example.git",
+  "version": "v1.0.2",
+  "description": "this is a examle library.It's a lib that add the support of Fractions.",
+  "link": "https://www.github.com/i8donkey/vortex-lib-fraction.git",
   "license": "GNU Lesser General Public License v3.0"
 }
